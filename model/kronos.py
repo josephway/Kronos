@@ -275,7 +275,14 @@ class Kronos(nn.Module, PyTorchModelHubMixin):
         s2_logits = self.head.cond_forward(x2)
         return s1_logits, s2_logits
 
-    def decode_s1(self, s1_ids, s2_ids, stamp=None, padding_mask=None):
+    def decode_s1(
+        self,
+        s1_ids,
+        s2_ids,
+        stamp=None,
+        padding_mask=None,
+        output_hidden_states: bool = False,
+    ):
         """
         Decodes only the s1 tokens.
 
@@ -287,11 +294,28 @@ class Kronos(nn.Module, PyTorchModelHubMixin):
             s2_ids (torch.Tensor): Input tensor of s2 token IDs. Shape: [batch_size, seq_len]
             stamp (torch.Tensor, optional): Temporal stamp tensor. Shape: [batch_size, seq_len]. Defaults to None.
             padding_mask (torch.Tensor, optional): Mask for padding tokens. Shape: [batch_size, seq_len]. Defaults to None.
+            output_hidden_states (bool, optional): If True, return per-layer hidden states (pre-RMSNorm)
+                alongside the default outputs. Defaults to False (backward-compatible 2-tuple).
 
         Returns:
-            Tuple[torch.Tensor, torch.Tensor]:
+            Tuple[torch.Tensor, torch.Tensor] when ``output_hidden_states=False`` (default):
                 - s1 logits: Logits for s1 token predictions. Shape: [batch_size, seq_len, s1_vocab_size]
-                - context: Context representation from the Transformer. Shape: [batch_size, seq_len, d_model]
+                - context: Context representation from the Transformer (post-RMSNorm). Shape: [batch_size, seq_len, d_model]
+
+            Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor]] when ``output_hidden_states=True``:
+                - s1 logits: same as above
+                - context: same as above (post-RMSNorm final state)
+                - all_hidden: list length ``n_layers`` (12 for Kronos-base), each element the
+                  **pre-RMSNorm** per-layer output ``[batch_size, seq_len, d_model]``. Collected
+                  AFTER each transformer layer's forward (including its internal sub-norms) but
+                  BEFORE the final ``self.norm``. This is the probe surface for K-10C Sanity-2
+                  layer sweep (CC4 selection/confirmation two-stage design).
+
+        Note:
+            The ``all_hidden`` entries are pre-RMSNorm per-layer outputs — they preserve each
+            layer's raw geometric signature, which may differ from the post-norm final context
+            used by existing callers. ``extract_anchor_context`` (qtos) consumes the post-norm
+            ``context``; ``extract_multilayer_context`` (qtos, K-10C-02) consumes ``all_hidden``.
         """
         x = self.embedding([s1_ids, s2_ids])
         if stamp is not None:
@@ -299,12 +323,17 @@ class Kronos(nn.Module, PyTorchModelHubMixin):
             x = x + time_embedding
         x = self.token_drop(x)
 
+        all_hidden: list = []
         for layer in self.transformer:
             x = layer(x, key_padding_mask=padding_mask)
+            if output_hidden_states:
+                all_hidden.append(x)
 
         x = self.norm(x)
 
         s1_logits = self.head(x)
+        if output_hidden_states:
+            return s1_logits, x, all_hidden
         return s1_logits, x
 
     def decode_s2(self, context, s1_ids, padding_mask=None):
